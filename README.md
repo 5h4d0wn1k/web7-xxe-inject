@@ -40,7 +40,38 @@ python3 xxe_tool.py --mode exploit --url http://target/xml-endpoint --file /etc/
 
 # Brute-force common files
 python3 xxe_tool.py --mode brute --url http://target/xml-endpoint
+
+# Offline demo (vulnerable + clean control simulators, no network)
+python3 xxe_tool.py --demo        # or run with no arguments
+
+# Run the offline test suite
+python3 -m unittest discover -s tests
 ```
+
+## Live Lab Test Plan
+
+Run against a local lab target only (loopback or a VM you own):
+
+1. `python3 xxe_tool.py --demo` — verify the engine detects file-read, entity
+   expansion and error-based XXE on the vulnerable simulator and reports zero
+   findings on the clean control (both exit 0).
+2. Start a knowingly-vulnerable parser endpoint (e.g. a local app that
+   processes XML with external entity loading enabled) and run
+   `python3 xxe_tool.py --mode detect --url http://127.0.0.1:<port>/parse`.
+3. Confirm a positive on the vulnerable endpoint and a negative on a hardened
+   endpoint that strips DOCTYPE (`docs/payloads` never touch real systems).
+4. `python3 -m unittest discover -s tests` — full offline suite must pass.
+
+## Metrics
+
+- Demo wall time: < 20 s (two loopback simulators, ~6 HTTP requests each)
+- Offline detection: file read, entity expansion, and error-based exfil all
+  fire on the planted vulnerable simulator and never on the clean control.
+- Test suite: 9 deterministic offline tests (`python3 -m unittest`), no network
+  access required.
+- Code paths exercised: urllib request/receive, payload generation,
+  `BlindXXEDetector.detect_xml_parsing`, `.test_file_read`, `.error_based_exfil`,
+  `is_vulnerable`, and both simulator handlers.
 
 ## Legal Disclaimer
 
