@@ -5,10 +5,13 @@ Hosts the built-in vulnerable/clean XML simulators on loopback and runs the
 real detection engine through urllib against them.
 """
 
+import io
 import os
 import sys
 import threading
 import unittest
+import contextlib
+import urllib.request
 from http.server import HTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -99,6 +102,46 @@ class XXEDetectionTest(unittest.TestCase):
             len(vuln["file_read"]["leaked_content"]),
             len(clean["file_read"]["leaked_content"]),
         )
+
+
+class VerboseLoggingTest(unittest.TestCase):
+    """-v request logging must report the method actually used (#18)."""
+
+    def test_verbose_line_reports_actual_method(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["method"] = req.get_method()
+            captured["url"] = req.full_url
+
+            class FakeResponse:
+                status = 200
+                headers = {}
+
+                @staticmethod
+                def read():
+                    return b"<result/>"
+
+            return FakeResponse()
+
+        original_urlopen = urllib.request.urlopen
+        urllib.request.urlopen = fake_urlopen
+        try:
+            detector = BlindXXEDetector(
+                "http://127.0.0.1:1/parse", method="GET", param="xml",
+                timeout=5, verbose=True,
+            )
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                detector._send("<root/>")
+        finally:
+            urllib.request.urlopen = original_urlopen
+
+        logged = out.getvalue()
+        self.assertIn("> GET http://127.0.0.1:1/parse", logged)
+        self.assertNotIn("> POST", logged)
+        self.assertEqual(captured["method"], "GET")
+
 
 
 class XXEDemoTest(unittest.TestCase):

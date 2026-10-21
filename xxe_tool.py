@@ -285,7 +285,7 @@ class BlindXXEDetector:
             req.add_header(k, v)
 
         if self.verbose:
-            print(f"      > POST {self.target_url} ({len(payload)} bytes)")
+            print(f"      > {self.method} {self.target_url} ({len(payload)} bytes)")
 
         try:
             resp = urllib.request.urlopen(req, timeout=self.timeout)
