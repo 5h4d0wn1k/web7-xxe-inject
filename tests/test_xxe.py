@@ -9,7 +9,7 @@ import os
 import sys
 import threading
 import unittest
-from http.server import HTTPServer
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from xxe_tool import (
@@ -115,3 +115,41 @@ class XXEDemoTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class SVGUploadMethodTest(unittest.TestCase):
+    """svg_upload_xxe must honor the configured method/param contract (#9)."""
+
+    def _record(self, method):
+        seen = []
+
+        class Rec(BaseHTTPRequestHandler):
+            def _r(self):
+                seen.append((self.command, self.headers.get("Content-Type")))
+                length = int(self.headers.get("Content-Length", 0))
+                self.rfile.read(length)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"<ok/>")
+
+            do_GET = do_POST = _r
+            log_message = lambda *a, **k: None
+
+        server = HTTPServer(("127.0.0.1", 0), Rec)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        from xxe_tool import XXEExploiter
+        ex = XXEExploiter(f"http://127.0.0.1:{server.server_port}/upload",
+                          method=method, param="xml")
+        ex.svg_upload_xxe("/etc/passwd")
+        return seen
+
+    def test_get_config_sends_get(self):
+        seen = self._record("GET")
+        self.assertEqual([m for m, _ in seen], ["GET"])
+        self.assertEqual(seen[0][1], "image/svg+xml")
+
+    def test_post_config_sends_post(self):
+        seen = self._record("POST")
+        self.assertEqual([m for m, _ in seen], ["POST"])
+        self.assertEqual(seen[0][1], "image/svg+xml")

